@@ -1,0 +1,17 @@
+#Creating random number and guessing it until correct
+import random
+import time
+print("Guessing game. I have picked a number between 1 and 20. Guess my number")
+time.sleep(3) #3 second timer for a break
+guess = int(input("What is your guess?: "))
+correct_num = random.randint(1,20)
+guess_count = 1
+
+while guess != correct_num:
+    guess_count += 1
+    if guess < correct_num:
+        guess = int(input("Need to guess higher. What is your guess?: "))
+    else:
+        guess = int(input("Need to guess lower. What is your guess?: "))
+    
+print(f"You answered correctly!! The answer is {correct_num}. It took you {guess_count} guesses.")
