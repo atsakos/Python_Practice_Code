@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+meraki_firewall_manager.py
+
+Simple CLI tool to view, export, backup, add, replace L3 firewall rules for Meraki MX networks.
+
+WARNING: Changing firewall rules can disrupt network connectivity. Always test in a lab/network
+you can afford to interrupt. Use --dry-run to preview changes without applying.
+
+Usage examples:
+  # List orgs
+  python meraki_firewall_manager.py list-orgs
+
+  # List networks in an org
+  python meraki_firewall_manager.py list-networks --org ORG_ID
+
+  # Show L3 firewall rules for a network
+  python meraki_firewall_manager.py show-rules --network NETWORK_ID
+
+  # Backup current rules to file
+  python meraki_firewall_manager.py backup --network NETWORK_ID --file backup.json
+
+  # Add a rule (appends to existing rules)
+  python meraki_firewall_manager.py add-rule --network NETWORK_ID \
+      --comment "Block bad host" --policy deny --protocol any \
+      --src-cidr 0.0.0.0/0 --src-port any --dst-cidr 10.0.0.0/24 --dst-port any \
+      --dry-run
+
+  # Replace entire ruleset from file
+  python meraki_firewall_manager.py replace-rules --network NETWORK_ID --file new_rules.json
+
+Environment:
+  MERAKI_API_KEY - required
+"""
+
+import os
+import sys
+import json
+import argparse
+import requests
+from datetime import datetime
+
+API_BASE = "https://api.meraki.com/api/v1"
+API_KEY_ENV = "MERAKI_API_KEY"
+HEADERS = {
+    "Content-Type": "application/json",
+    # 'X-Cisco-Meraki-API-Key' header set dynamically from env
+}
+
+def get_api_key():
+    key = os.getenv(API_KEY_ENV)
+    if not key:
+        print(f"ERROR: {API_KEY_ENV} environment variable not set.", file=sys.stderr)
+        sys.exit(2)
+    return key
+
+def request(method, path, params=None, json_body=None):
+    key = get_api_key()
+    headers = HEADERS.copy()
+    headers["X-Cisco-Meraki-API-Key"] = key
+    url = f"{API_BASE}{path}"
+    resp = requests.request(method, url, headers=headers, params=params, json=json_body, timeout=30)
+    if not resp.ok:
+        # print helpful error info
+        try:
+            body = resp.json()
+        except ValueError:
+            body = resp.text
+        raise RuntimeError(f"API {method} {url} returned {resp.status_code}: {body}")
+    if resp.text:
+        try:
+            return resp.json()
+        except ValueError:
+            return resp.text
+    return None
+
+# ---------- API convenience functions ----------
+def list_organizations():
+    return request("GET", "/organizations")
+
+def list_networks(org_id):
+    return request("GET", f"/organizations/{org_id}/networks")
+
+def get_l3_firewall_rules(network_id):
+    """
+    GET network appliance L3 firewall rules.
+    Returns a dict representing the ruleset response.
+    """
+    return request("GET", f"/networks/{network_id}/appliance/firewall/l3FirewallRules")
+
+def update_l3_firewall_rules(network_id, rules_payload):
+    """
+    PUT new L3 firewall rules.
+    rules_payload is the full payload expected by the API (e.g. {"rules": [...], "syslogEnabled": False})
+    """
+    return request("PUT", f"/networks/{network_id}/appliance/firewall/l3FirewallRules", json_body=rules_payload)
+
+# ---------- Helpers ----------
+def backup_rules(network_id, filename=None):
+    data = get_l3_firewall_rules(network_id)
+    if filename is None:
+        ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        filename = f"meraki_{network_id}_l3_rules_backup_{ts}.json"
+    with open(filename, "w") as f:
+        json.dump(data, f, indent=2)
+    return filename
+
+def load_rules_from_file(filename):
+    with open(filename, "r") as f:
+        return json.load(f)
+
+def print_rules_brief(ruleset):
+    # ruleset typically has keys like 'rules' (list) and maybe 'syslogEnabled'
+    rules = ruleset.get("rules", []) if isinstance(ruleset, dict) else []
+    print(f"Total rules: {len(rules)}")
+    for i, r in enumerate(rules):
+        # print compact view
+        comment = r.get("comment", "")
+        policy = r.get("policy", "")
+        proto = r.get("protocol", "")
+        src = r.get("srcCidr", r.get("source", r.get("src", "n/a")))
+        srcp = r.get("srcPort", r.get("sourcePort", "any"))
+        dst = r.get("destCidr", r.get("destination", r.get("dest", "n/a")))
+        dstp = r.get("destPort", r.get("destinationPort", "any"))
+        print(f"{i+1:02d}. {policy:5} {proto:6} {src}:{srcp} -> {dst}:{dstp}  # {comment}")
+
+# ---------- CLI operations ----------
+def cmd_list_orgs(_args):
+    orgs = list_organizations()
+    print(json.dumps(orgs, indent=2))
+
+def cmd_list_networks(args):
+    if not args.org:
+        print("ERROR: --org ORG_ID required for list-networks", file=sys.stderr)
+        sys.exit(2)
+    nets = list_networks(args.org)
+    print(json.dumps(nets, indent=2))
+
+def cmd_show_rules(args):
+    if not args.network:
+        print("ERROR: --network NETWORK_ID required for show-rules", file=sys.stderr)
+        sys.exit(2)
+    rules = get_l3_firewall_rules(args.network)
+    print(json.dumps(rules, indent=2))
+    print("\nBrief summary:")
+    print_rules_brief(rules)
+
+def cmd_backup(args):
+    if not args.network:
+        print("ERROR: --network NETWORK_ID required for backup", file=sys.stderr)
+        sys.exit(2)
+    filename = backup_rules(args.network, args.file)
+    print(f"Backed up L3 firewall rules to: {filename}")
+
+def cmd_export(args):
+    # alias for backup, prints file path
+    return cmd_backup(args)
+
+def cmd_add_rule(args):
+    if not args.network:
+        print("ERROR: --network NETWORK_ID required for add-rule", file=sys.stderr)
+        sys.exit(2)
+
+    # Build a rule dict in the common Meraki shape. Field names may need to be matched
+    # to your API schema — adjust if your API expects slightly different names.
+    new_rule = {
+        "comment": args.comment or "",
+        "policy": args.policy or "deny",     # 'allow' or 'deny'
+        "protocol": args.protocol or "any",  # e.g., 'tcp', 'udp', 'any'
+        "srcCidr": args.src_cidr or "any",
+        "srcPort": args.src_port or "any",
+        "destCidr": args.dst_cidr or "any",
+        "destPort": args.dst_port or "any",
+    }
+
+    print("New rule preview:")
+    print(json.dumps(new_rule, indent=2))
+
+    # Fetch existing rules, back them up
+    current = get_l3_firewall_rules(args.network)
+    print("Fetched current rules; backing up before applying change...")
+    backup_file = backup_rules(args.network)
+    print(f"Backup written: {backup_file}")
+
+    # Append the new rule. The API expects a full payload with 'rules' (list) and often 'syslogEnabled'.
+    # We'll try to preserve other top-level fields present in the response.
+    payload = current.copy()
+    rules_list = payload.get("rules", [])
+    rules_list.append(new_rule)
+    payload["rules"] = rules_list
+
+    print("Resulting rules count:", len(rules_list))
+
+    if args.dry_run:
+        print("Dry-run enabled; not pushing to API. Exiting.")
+        return
+
+    print("Pushing updated rules to the Meraki API...")
+    resp = update_l3_firewall_rules(args.network, payload)
+    print("API response:")
+    print(json.dumps(resp, indent=2))
+
+def cmd_replace_rules(args):
+    if not args.network or not args.file:
+        print("ERROR: --network and --file required for replace-rules", file=sys.stderr)
+        sys.exit(2)
+
+    new_payload = load_rules_from_file(args.file)
+    # Basic sanity check
+    if "rules" not in new_payload:
+        print("ERROR: loaded file does not contain a 'rules' key. Expecting payload like {'rules': [...], 'syslogEnabled': false}", file=sys.stderr)
+        sys.exit(2)
+
+    print(f"Loaded {len(new_payload.get('rules', []))} rules from {args.file}")
+    print("Backing up current rules first...")
+    backup_file = backup_rules(args.network)
+    print(f"Backup written: {backup_file}")
+
+    if args.dry_run:
+        print("Dry-run enabled; not pushing new rules. Exiting.")
+        return
+
+    resp = update_l3_firewall_rules(args.network, new_payload)
+    print("API response:")
+    print(json.dumps(resp, indent=2))
+
+# ---------- Argparse ----------
+def build_parser():
+    p = argparse.ArgumentParser(description="Meraki MX L3 firewall rules manager")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list-orgs", help="List organizations")
+
+    p_list_nets = sub.add_parser("list-networks", help="List networks in org")
+    p_list_nets.add_argument("--org", required=True, help="Organization ID")
+
+    p_show = sub.add_parser("show-rules", help="Show L3 firewall rules for a network")
+    p_show.add_argument("--network", required=True, help="Network ID")
+
+    p_backup = sub.add_parser("backup", help="Backup L3 firewall rules to file")
+    p_backup.add_argument("--network", required=True, help="Network ID")
+    p_backup.add_argument("--file", required=False, help="Output file path")
+
+    p_export = sub.add_parser("export", help="Alias for backup")
+    p_export.add_argument("--network", required=True, help="Network ID")
+    p_export.add_argument("--file", required=False, help="Output file path")
+
+    p_add = sub.add_parser("add-rule", help="Append a firewall rule to network's L3 rules")
+    p_add.add_argument("--network", required=True, help="Network ID")
+    p_add.add_argument("--comment", required=False, help="Rule comment/description")
+    p_add.add_argument("--policy", choices=["allow", "deny"], default="deny", help="allow or deny")
+    p_add.add_argument("--protocol", default="any", help="Protocol, e.g. tcp, udp, any")
+    p_add.add_argument("--src-cidr", default="any", help="Source CIDR")
+    p_add.add_argument("--src-port", default="any", help="Source port or 'any'")
+    p_add.add_argument("--dst-cidr", default="any", help="Destination CIDR")
+    p_add.add_argument("--dst-port", default="any", help="Destination port or 'any'")
+    p_add.add_argument("--dry-run", action="store_true", help="Don't push changes to Meraki API")
+
+    p_replace = sub.add_parser("replace-rules", help="Replace entire L3 ruleset from a JSON file")
+    p_replace.add_argument("--network", required=True, help="Network ID")
+    p_replace.add_argument("--file", required=True, help="JSON file containing full payload (must include 'rules' key)")
+    p_replace.add_argument("--dry-run", action="store_true", help="Don't push changes to Meraki API")
+
+    return p
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        if args.cmd == "list-orgs":
+            cmd_list_orgs(args)
+        elif args.cmd == "list-networks":
+            cmd_list_networks(args)
+        elif args.cmd == "show-rules":
+            cmd_show_rules(args)
+        elif args.cmd == "backup" or args.cmd == "export":
+            cmd_backup(args)
+        elif args.cmd == "add-rule":
+            cmd_add_rule(args)
+        elif args.cmd == "replace-rules":
+            cmd_replace_rules(args)
+        else:
+            parser.print_help()
+    except Exception as e:
+        print("ERROR:", str(e), file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
